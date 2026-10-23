@@ -1,5 +1,5 @@
 import { chat, watsonxModel } from "@/lib/watsonx";
-import { webSearch } from "@/lib/search";
+import { webSearch, hasSearchKey } from "@/lib/search";
 import { leanRules, briefFrom } from "@/lib/prompts";
 import { extractJSON } from "@/lib/json";
 import { rateLimit } from "@/lib/ratelimit";
@@ -15,7 +15,7 @@ function cleanRole(s) {
 
 // Short keyword input is used as-is. A longer job description gets a tiny model call
 // (~300 tokens) to pull out the job title; on any failure we fall back to its first line.
-async function extractRole(inputs, signal) {
+async function extractRole(inputs, signal, creds) {
   const firstLine = cleanRole(inputs.jd.split("\n").map((l) => l.trim()).find(Boolean));
   if (inputs.jd.trim().length <= 80) return cleanRole(inputs.jd) || firstLine;
   try {
@@ -26,6 +26,7 @@ async function extractRole(inputs, signal) {
       ],
       maxTokens: 20,
       signal,
+      creds,
     });
     return cleanRole(String(message.content || "").split("\n")[0]) || firstLine;
   } catch {
@@ -87,36 +88,80 @@ export async function POST(request) {
 
   const maxSearches = Math.max(1, Math.min(30, parseInt(process.env.MAX_SEARCHES || "6", 10) || 6));
 
+  // Optional bring-your-own credentials (used only for this request, never stored or logged).
+  const c = body && body.creds && typeof body.creds === "object" ? body.creds : {};
+  const creds = {
+    apiKey: String(c.wxApiKey || "").slice(0, 200),
+    url: String(c.wxUrl || "").slice(0, 200),
+    projectId: String(c.wxProjectId || "").slice(0, 100),
+  };
+  const tavilyKey = String(c.tavilyKey || "").slice(0, 200);
+
   const stream = new ReadableStream({
     async start(controller) {
       const send = (obj) => { try { controller.enqueue(enc.encode(JSON.stringify(obj) + "\n")); } catch {} };
       const signal = request.signal;
       try {
         send({ type: "status", text: "Starting research…" });
-        send({ type: "log", text: `Model: ${watsonxModel()}` });
+        const ownWx = Boolean(creds.apiKey || creds.url || creds.projectId);
+        send({ type: "log", text: `Model: ${watsonxModel(creds)}${ownWx ? " (your watsonx project)" : ""}` });
 
         const registry = []; // {id,title,url,date}
         const byUrl = new Map();
 
         // 1) Search: server-built queries run in parallel, no model involved.
         send({ type: "status", text: "Identifying the role…" });
-        const role = await extractRole(inputs, signal);
+        const role = await extractRole(inputs, signal, creds);
         send({ type: "log", text: `Role: ${role}` });
-        const queries = buildQueries(inputs, role).slice(0, maxSearches);
-        send({ type: "status", text: "Searching the web…" });
-        queries.forEach((x, n) => send({ type: "log", text: `Search ${n + 1}: ${x.q}` }));
-        const settled = await Promise.all(
-          queries.map(async ({ q, maxChars }) => {
-            try { return { q, results: await webSearch(q, signal, { maxChars }) }; }
-            catch (e) { return { q, error: e }; }
-          })
-        );
+
+        // Web search is optional: with no Tavily key, or if Tavily fails/limits us, the report is
+        // still written from the model's own knowledge and flagged as unverified.
+        const notes = []; // shown in the report's "data gaps"
         const blocks = [];
+        let settled = [];
+        if (!hasSearchKey(tavilyKey)) {
+          send({ type: "log", text: "No Tavily key configured - skipping web search." });
+          notes.push("Web search was not available (no Tavily API key configured), so figures are unverified model estimates with no sources.");
+        } else {
+          const queries = buildQueries(inputs, role).slice(0, maxSearches);
+          send({ type: "status", text: "Searching the web…" });
+          queries.forEach((x, n) => send({ type: "log", text: `Search ${n + 1}: ${x.q}` }));
+          const run = async (q, maxChars) => {
+            try { return { q, results: await webSearch(q, signal, { maxChars, apiKey: tavilyKey }) }; }
+            catch (e) { return { q, error: e }; }
+          };
+          settled = await Promise.all(
+            queries.map(async ({ q, maxChars }) => {
+              let r = await run(q, maxChars);
+              if (r.error && r.error.kind === "rate" && !signal.aborted) {
+                await new Promise((res) => setTimeout(res, 1500)); // one retry on 429
+                r = await run(q, maxChars);
+              }
+              return r;
+            })
+          );
+        }
+        const failed = settled.filter((s) => s.error);
+        if (failed.length) {
+          const kinds = new Set(failed.map((s) => s.error.kind));
+          const all = failed.length === settled.length;
+          const why = kinds.has("quota")
+            ? "the Tavily search quota/plan limit has been reached"
+            : kinds.has("rate")
+            ? "Tavily rate-limited the requests"
+            : kinds.has("auth")
+            ? "the Tavily API key was rejected"
+            : "the search service returned errors";
+          notes.push(
+            all
+              ? `Web search failed (${why}), so figures are unverified model estimates with no sources.`
+              : `${failed.length} of ${settled.length} web searches failed (${why}); some sections have less evidence.`
+          );
+          send({ type: "log", text: `Search problem: ${why}.` });
+        }
         for (const s of settled) {
           if (s.error) {
-            const msg = s.error.message || String(s.error);
-            send({ type: "log", text: `  ↳ search failed (${s.q}): ${msg}` });
-            if (/missing TAVILY_API_KEY/.test(msg) || /error (401|403)/.test(msg)) throw s.error;
+            send({ type: "log", text: `  ↳ search failed (${s.q}): ${s.error.message || s.error}` });
             continue;
           }
           const out = s.results.map((r) => {
@@ -134,10 +179,18 @@ export async function POST(request) {
         const { message, finish, usage } = await chat({
           messages: [
             { role: "system", content: leanRules() },
-            { role: "user", content: briefFrom(inputs) + "\n\nSEARCH RESULTS:\n" + (blocks.join("\n\n") || "(none retrieved)") },
+            {
+              role: "user",
+              content:
+                briefFrom(inputs) +
+                (blocks.length
+                  ? "\n\nSEARCH RESULTS:\n" + blocks.join("\n\n")
+                  : "\n\nNO WEB SEARCH RESULTS are available. Use \"sources\": [] and no source_ids. Give only clearly hedged estimates from general knowledge, mark every confidence \"low\", set unknown figures to null, and list this limitation in data_gaps."),
+            },
           ],
           maxTokens: 3500,
           signal,
+          creds,
         });
         const finalText = message.content || "";
         if (finish === "length") send({ type: "log", text: "Warning: output hit the token limit and may be truncated." });
@@ -155,6 +208,7 @@ export async function POST(request) {
             ],
             maxTokens: 3500,
             signal,
+            creds,
           });
           data = extractJSON(rep.message.content || "");
         }
@@ -174,9 +228,8 @@ export async function POST(request) {
             });
           if (!sources.length) sources = registry.map((r) => ({ id: r.id, title: r.title, publisher: "", url: r.url, date: r.date }));
           data.sources = sources;
-          if (!registry.length) {
-            data.data_gaps = [...(Array.isArray(data.data_gaps) ? data.data_gaps : []), "No web search results were retrieved. Treat every figure as an unverified model estimate."];
-          }
+          if (!registry.length && !notes.length) notes.push("No web search results were retrieved. Treat every figure as an unverified model estimate.");
+          if (notes.length) data.data_gaps = [...notes, ...(Array.isArray(data.data_gaps) ? data.data_gaps : [])];
           send({ type: "result", data, inputs });
         }
       } catch (e) {

@@ -7,6 +7,7 @@ import { extractJSON } from "@/lib/json";
 import { renderReportHtml, renderRawHtml } from "@/lib/render-sections";
 
 const CODE_KEY = "tmr.accessCode";
+const KEYS_KEY = "tmr.ownKeys"; // sessionStorage only: cleared when the tab closes
 
 function copyText(t) {
   if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(t).catch(() => fallbackCopy(t));
@@ -26,6 +27,7 @@ function fallbackCopy(t) {
 export default function Page() {
   const [form, setForm] = useState({ jd: "", country: "", city: "", currency: "", seniority: "", workmode: "", hireType: "" });
   const [accessCode, setAccessCode] = useState("");
+  const [own, setOwn] = useState({ wxApiKey: "", wxUrl: "", wxProjectId: "", tavilyKey: "" });
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState("");
@@ -37,12 +39,17 @@ export default function Page() {
   const [pasteBack, setPasteBack] = useState("");
   const [copied, setCopied] = useState(false);
   const abortRef = useRef(null);
+  const keysRef = useRef(null);
   const lastReport = useRef(null);
   const reportRef = useRef(null);
   const logRef = useRef(null);
 
   useEffect(() => {
     try { setAccessCode(localStorage.getItem(CODE_KEY) || ""); } catch {}
+    try {
+      const k = JSON.parse(sessionStorage.getItem(KEYS_KEY) || "null");
+      if (k && typeof k === "object") setOwn((o) => ({ ...o, ...k }));
+    } catch {}
   }, []);
 
   useEffect(() => {
@@ -58,6 +65,9 @@ export default function Page() {
   }, [log]);
 
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
+  const setKey = (k) => (e) => setOwn((o) => ({ ...o, [k]: e.target.value }));
+  const usingOwn = Boolean(own.wxApiKey.trim() || own.wxUrl.trim() || own.wxProjectId.trim());
+  const wxIncomplete = usingOwn && !(own.wxApiKey.trim() && own.wxUrl.trim() && own.wxProjectId.trim());
 
   function validate() {
     if (form.jd.trim().length < 3) return "Please paste a job description or a few role keywords.";
@@ -77,7 +87,13 @@ export default function Page() {
     setHtml("");
     const v = validate();
     if (typeof v === "string") { setError(v); return; }
+    if (wxIncomplete) {
+      setError("To use your own watsonx project, fill in all three fields: API key, URL and project ID (or clear them to use the site's default).");
+      if (keysRef.current) keysRef.current.showModal();
+      return;
+    }
     try { localStorage.setItem(CODE_KEY, accessCode); } catch {}
+    try { sessionStorage.setItem(KEYS_KEY, JSON.stringify(own)); } catch {}
     const ctl = new AbortController();
     abortRef.current = ctl;
     setRunning(true);
@@ -88,7 +104,7 @@ export default function Page() {
         method: "POST",
         signal: ctl.signal,
         headers: { "content-type": "application/json", "x-access-code": accessCode },
-        body: JSON.stringify({ inputs: v }),
+        body: JSON.stringify({ inputs: v, creds: own }),
       });
       if (!res.ok) {
         let m = `Request failed (${res.status}).`;
@@ -191,6 +207,9 @@ export default function Page() {
             Talent Market Researcher
             <small>Live, source-cited talent market reports from a job description</small>
           </h1>
+          <button type="button" className="primary hdrbtn" onClick={() => keysRef.current && keysRef.current.showModal()}>
+            {usingOwn || own.tavilyKey.trim() ? "API keys ✓" : "Use my own API keys"}
+          </button>
         </div>
       </header>
 
@@ -240,6 +259,40 @@ export default function Page() {
             </div>
           </div>
 
+          <dialog
+            ref={keysRef}
+            aria-labelledby="keysTitle"
+            onClick={(e) => { if (e.target === keysRef.current) keysRef.current.close(); }}
+          >
+            <div className="body">
+              <h2 id="keysTitle">Use my own API keys</h2>
+              <p className="hint" style={{ margin: "0 0 4px" }}>
+                Run on your own watsonx.ai project instead of the site&apos;s. All three watsonx fields are required together. The Tavily key is optional: without any Tavily key the report is written without web search and marked unverified. Keys are sent over HTTPS for each request only, are never stored on the server, and are kept in this tab until you close it.
+              </p>
+              <div className="row">
+                <label htmlFor="wxApiKey">watsonx API key</label>
+                <input id="wxApiKey" type="password" value={own.wxApiKey} onChange={setKey("wxApiKey")} placeholder="IBM Cloud API key" autoComplete="off" />
+              </div>
+              <div className="row">
+                <label htmlFor="wxProjectId">watsonx project ID</label>
+                <input id="wxProjectId" value={own.wxProjectId} onChange={setKey("wxProjectId")} placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" autoComplete="off" />
+              </div>
+              <div className="row">
+                <label htmlFor="wxUrl">watsonx URL</label>
+                <input id="wxUrl" value={own.wxUrl} onChange={setKey("wxUrl")} placeholder="https://us-south.ml.cloud.ibm.com" autoComplete="off" />
+              </div>
+              <div className="row">
+                <label htmlFor="tavilyKey">Tavily API key <span className="opt">(optional)</span></label>
+                <input id="tavilyKey" type="password" value={own.tavilyKey} onChange={setKey("tavilyKey")} placeholder="tvly-…" autoComplete="off" />
+              </div>
+              {wxIncomplete && <p className="hint" style={{ margin: "10px 0 0", color: "#b42318" }}>Fill in all three watsonx fields, or clear them to use the site&apos;s default.</p>}
+              <div className="actions" style={{ marginTop: 16 }}>
+                <button type="button" className="primary" style={{ width: "auto", fontSize: 14, padding: "8px 18px" }} onClick={() => keysRef.current.close()}>Done</button>
+                <button type="button" onClick={() => setOwn({ wxApiKey: "", wxUrl: "", wxProjectId: "", tavilyKey: "" })}>Clear all</button>
+              </div>
+            </div>
+          </dialog>
+
           <details className="adv">
             <summary>Access code (only if the site owner enabled one)</summary>
             <div className="row">
@@ -254,7 +307,7 @@ export default function Page() {
             </button>
           </div>
           <p className="hint" style={{ margin: "10px 0 0" }}>
-            Research runs on the server with live web search; the API keys never reach your browser. Prefer another chatbot? Use “Copy research prompt”.
+            Research runs on the server with live web search. Prefer another chatbot? Use “Copy research prompt”.
           </p>
         </section>
 
