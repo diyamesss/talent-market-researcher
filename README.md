@@ -23,7 +23,7 @@ Production: `npm run build && npm start`, or deploy to Vercel / any Node host an
 | `WATSONX_MODEL` | Must support tool calling. Verified: `meta-llama/llama-3-3-70b-instruct`, `mistralai/mistral-medium-2505`, `openai/gpt-oss-120b` |
 | `TAVILY_API_KEY` | Web search provider key (watsonx has no built-in web search) |
 | `ACCESS_CODE` | Optional. If set, users must enter it in the UI. Protects your credits |
-| `MAX_SEARCHES` | Searches per run (default 12) |
+| `MAX_SEARCHES` | Searches per run (default 6; run in parallel, then one model call writes the report) |
 | `RATE_LIMIT_PER_HOUR` | Per-IP runs per hour (default 10, in-memory) |
 
 ## Notes
