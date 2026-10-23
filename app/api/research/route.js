@@ -9,22 +9,44 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
 
-// Builds the search queries on the server (no model call): one per report topic.
-function buildQueries(inputs) {
-  const role = (inputs.jd.split("\n").map((l) => l.trim()).find(Boolean) || "")
-    .replace(/[^\p{L}\p{N}\s/+#.&-]/gu, " ").replace(/\s+/g, " ").slice(0, 80).trim();
+function cleanRole(s) {
+  return String(s || "").replace(/[^\p{L}\p{N}\s/+#.&-]/gu, " ").replace(/\s+/g, " ").slice(0, 80).trim();
+}
+
+// Short keyword input is used as-is. A longer job description gets a tiny model call
+// (~300 tokens) to pull out the job title; on any failure we fall back to its first line.
+async function extractRole(inputs, signal) {
+  const firstLine = cleanRole(inputs.jd.split("\n").map((l) => l.trim()).find(Boolean));
+  if (inputs.jd.trim().length <= 80) return cleanRole(inputs.jd) || firstLine;
+  try {
+    const { message } = await chat({
+      messages: [
+        { role: "system", content: "Reply with ONLY the job title this job description is hiring for (2-6 words, e.g. \"Senior Data Engineer\"). No punctuation, no explanation." },
+        { role: "user", content: inputs.jd.slice(0, 1500) },
+      ],
+      maxTokens: 20,
+      signal,
+    });
+    return cleanRole(String(message.content || "").split("\n")[0]) || firstLine;
+  } catch {
+    return firstLine;
+  }
+}
+
+// Builds the search queries on the server: one per report topic. Salary gets longer excerpts.
+function buildQueries(inputs, role) {
   const where = inputs.city ? `${inputs.city} ${inputs.country}` : inputs.country;
   const who = `${inputs.seniority ? inputs.seniority + " " : ""}${role}`.trim();
   const year = new Date().getFullYear();
   const qs = [
-    `${who} salary ${where} ${year}`,
-    `${who} talent pool shortage demand ${where}`,
-    `companies hiring ${role} ${where}`,
-    `${role} job boards communities universities ${inputs.country}`,
-    `employment law notice period probation employer contributions ${inputs.country} ${year}`,
-    `${role} hiring market trends news ${inputs.country} ${year}`,
+    { q: `${who} salary ${where} ${year}`, maxChars: 600 },
+    { q: `${who} talent pool shortage demand ${where}` },
+    { q: `companies hiring ${role} ${where}` },
+    { q: `${role} job boards communities universities ${inputs.country}` },
+    { q: `employment law notice period probation employer contributions ${inputs.country} ${year}` },
+    { q: `${role} hiring market trends news ${inputs.country} ${year}` },
   ];
-  if (inputs.hireType === "foreign") qs.push(`work permit visa requirements foreign workers ${inputs.country} ${year}`);
+  if (inputs.hireType === "foreign") qs.push({ q: `work permit visa requirements foreign workers ${inputs.country} ${year}` });
   return qs;
 }
 
@@ -77,12 +99,15 @@ export async function POST(request) {
         const byUrl = new Map();
 
         // 1) Search: server-built queries run in parallel, no model involved.
-        const queries = buildQueries(inputs).slice(0, maxSearches);
+        send({ type: "status", text: "Identifying the role…" });
+        const role = await extractRole(inputs, signal);
+        send({ type: "log", text: `Role: ${role}` });
+        const queries = buildQueries(inputs, role).slice(0, maxSearches);
         send({ type: "status", text: "Searching the web…" });
-        queries.forEach((q, n) => send({ type: "log", text: `Search ${n + 1}: ${q}` }));
+        queries.forEach((x, n) => send({ type: "log", text: `Search ${n + 1}: ${x.q}` }));
         const settled = await Promise.all(
-          queries.map(async (q) => {
-            try { return { q, results: await webSearch(q, signal) }; }
+          queries.map(async ({ q, maxChars }) => {
+            try { return { q, results: await webSearch(q, signal, { maxChars }) }; }
             catch (e) { return { q, error: e }; }
           })
         );
